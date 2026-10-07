@@ -6,14 +6,19 @@
 #   openpublic        attach (or create) the "opencode" container in $PWD's workspace
 #   openpublic -r     recreate the container from scratch (keeps opencode data dirs)
 #
-# What it does with auth (and why it's safe):
+# Auth safety:
 #   - Reads the ACTIVE gh token from the HOST keyring at launch time only.
 #   - Writes it to /tmp/opencode-gh-token (0600) and mounts it READ-ONLY
 #     into the container at /run/gh-token.
 #   - Inside: git uses a credential helper that reads /run/gh-token, and
-#     `opencode` runs with GH_TOKEN set. Nothing is written to disk config
-#     inside the container, so a leaked container = a 0600 /tmp file on host.
-#   - No token is ever stored in git, scripts, or env files.
+#     `opencode` runs with GH_TOKEN set. Nothing is written to container disk.
+#
+# Non-root guarantee:
+#   - Container runs as user "dev" with your host UID/GID (UID_GID env, default 1000:1000).
+#   - opencode data dirs mount to /home/dev/*, workspace to /workspace.
+#   - Files created inside the container are owned by YOU on the host, never root.
+#     (The container entrypoint installs remaining tools as root first; runtime
+#      commands and opencode itself always run with --user dev.)
 set -euo pipefail
 
 reset=0
@@ -30,6 +35,9 @@ CONTAINER=opencode
 NET_NAME=opencode-net
 NET_SUBNET=172.20.0.0/16
 IMAGE="${OPENPUBLIC_IMAGE:-opencode-warp}"
+UID_GID="${OPENPUBLIC_UID_GID:-$(id -u):$(id -g)}"
+USER_NAME=dev
+HOME_IN=/home/dev
 TOKEN_FILE=/tmp/opencode-gh-token
 HOST_WORKSPACE="${OPENPUBLIC_WORKSPACE:-$(dirname "$PWD")}"
 WORKDIR_BASE=/workspace
@@ -43,9 +51,9 @@ gh auth token >"$TOKEN_FILE"
 [ -s "$TOKEN_FILE" ] || die "could not extract gh token"
 GH_USER="$(gh api user --jq .login 2>/dev/null || echo "gh-token")"
 
-# ── reset: stop + remove container (opencode data dirs preserved by default) ──
+# ── reset: stop + remove container (opencode data dirs preserved) ─────────────
 if [ "$reset" -eq 1 ]; then
-  log "Recreating $CONTAINER container (data dirs kept)..."
+  log "Recreating $CONTAINER container (data dirs kept, owner: $UID_GID)..."
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 else
   docker inspect "$CONTAINER" >/dev/null 2>&1 && log "Container exists, attaching..." || true
@@ -66,29 +74,41 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
   done
   [ -n "$OCP_IP" ] || die "no free IP in $NET_SUBNET"
 
-  log "Creating container at $OCP_IP..."
+  log "Creating container at $OCP_IP (user $USER_NAME uid:gid $UID_GID)..."
   docker run -d --name "$CONTAINER" \
     --network "$NET_NAME" --ip "$OCP_IP" \
     --cap-add NET_ADMIN --device /dev/net/tun \
+    -e HOME="$HOME_IN" \
     -v "$HOST_WORKSPACE":"$WORKDIR_BASE" \
-    -v "$HOME/.opencode:/root/.opencode" \
-    -v "$HOME/.config/opencode:/root/.config/opencode" \
-    -v "$HOME/.local/share/opencode:/root/.local/share/opencode" \
-    -v "$HOME/.local/state/opencode:/root/.local/state/opencode" \
-    -v "$HOME/.cache/opencode:/root/.cache/opencode" \
+    -v "$HOME/.opencode:$HOME_IN/.opencode" \
+    -v "$HOME/.config/opencode:$HOME_IN/.config/opencode" \
+    -v "$HOME/.local/share/opencode:$HOME_IN/.local/share/opencode" \
+    -v "$HOME/.local/state/opencode:$HOME_IN/.local/state/opencode" \
+    -v "$HOME/.cache/opencode:$HOME_IN/.cache/opencode" \
     -v "$TOKEN_FILE":/run/gh-token:ro \
     -p 13000:3000 -p 13213:3213 -p 14096:4096 -p 17654:7654 \
     "$IMAGE" sleep infinity >/dev/null
-  log "Created."
 fi
 
-docker start "$CONTAINER" >/dev/null
+# ── bootstrap user (idempotent; runs as root inside, once) ────────────────────
+docker exec -e UID_GID="$UID_GID" -e USER_NAME="$USER_NAME" -e HOME_IN="$HOME_IN" \
+  "$CONTAINER" sh -c '
+    set -e
+    UID_="${UID_GID%%:*}"; GID_="${UID_GID##*:}"
+    if ! id -u "$USER_NAME" >/dev/null 2>&1; then
+      if ! getent group "$GID_" >/dev/null; then groupadd -g "$GID_" "$USER_NAME"; fi
+      useradd -u "$UID_" -g "$GID_" -m -d "$HOME_IN" -s /bin/bash "$USER_NAME" 2>/dev/null \
+        || useradd -u "$UID_" -g "$GID_" -d "$HOME_IN" -s /bin/bash "$USER_NAME"
+    fi
+    mkdir -p "$HOME_IN/.opencode" "$HOME_IN/.config/opencode" "$HOME_IN/.local/share/opencode" \
+             "$HOME_IN/.local/state/opencode" "$HOME_IN/.cache/opencode"
+  ' || die "could not bootstrap user in container"
 
-# ── ensure git + gh inside (best-effort; binary gh, not apt) ──────────────────
+# ── ensure git + gh inside (best-effort; binary gh, not apt) — as root once ───
 if ! docker exec "$CONTAINER" sh -c 'command -v git >/dev/null'; then
   log "git missing inside container; best-effort install..."
   docker exec "$CONTAINER" sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git' \
-    >/dev/null 2>&1 || log "git install skipped (auth still works via token once git present)"
+    >/dev/null 2>&1 || log "git install skipped"
 fi
 if ! docker exec "$CONTAINER" sh -c 'command -v gh >/dev/null'; then
   log "gh missing inside container; installing official binary (fast, no apt)..."
@@ -100,19 +120,23 @@ if ! docker exec "$CONTAINER" sh -c 'command -v gh >/dev/null'; then
   " >/dev/null 2>&1 && log "gh ${GHV} installed." || log "gh binary install skipped; GIT auth still works."
 fi
 
-# ── wire credentials inside container (no token stored on disk here) ──────────
-docker exec -e GH_USER="$GH_USER" "$CONTAINER" sh -c '
+# ── ensure workspace + data dirs writable by dev (owner match = your host uid) ─
+docker exec "$CONTAINER" sh -c "chown -R $UID_GID $WORKDIR_BASE $HOME_IN" 2>/dev/null || true
+
+# ── wire credentials as dev (token readable by all container users; 0600 host) ─
+docker exec --user "$USER_NAME" -e GH_USER="$GH_USER" -e HOME="$HOME_IN" "$CONTAINER" sh -c '
   if command -v git >/dev/null; then
     git config --global credential.helper "!f() { test -r /run/gh-token && printf \"username=%s\\npassword=%s\\n\" \"$GH_USER\" \"$(cat /run/gh-token)\"; }; f"
     git config --global --get-all credential.helper >/dev/null
   fi
 ' || die "could not wire git credentials inside container"
-log "git credential helper wired."
+log "git credential helper wired (user: $USER_NAME)."
 
 # ── pick workspace dir + attach ───────────────────────────────────────────────
 cd_inside="${WORKDIR_BASE}/$(basename "$PWD")"
 docker exec "$CONTAINER" test -d "$cd_inside" 2>/dev/null || cd_inside="$WORKDIR_BASE"
-log "Attaching opencode in $cd_inside (user: $GH_USER)..."
+log "Attaching opencode in $cd_inside (user: $USER_NAME, gh identity: $GH_USER)..."
 
-EXEC_ARGS=(docker exec -it -e "GH_TOKEN=$(cat "$TOKEN_FILE")")
-exec "${EXEC_ARGS[@]}" "$CONTAINER" sh -c "cd '$cd_inside' && exec opencode"
+EXEC_ARGS=(docker exec -it --user "$USER_NAME" -e "HOME=$HOME_IN" -e "GH_TOKEN=$(cat "$TOKEN_FILE")")
+EXEC_CMD="${OPENPUBLIC_EXEC_CMD:-opencode}"
+exec "${EXEC_ARGS[@]}" "$CONTAINER" sh -c "cd '$cd_inside' && exec $EXEC_CMD"
