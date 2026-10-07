@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# openpublic — run opencode inside an always-fresh container with your host
+# GitHub credentials passed through automatically.
+#
+# Usage:
+#   openpublic        attach (or create) the "opencode" container in $PWD's workspace
+#   openpublic -r     recreate the container from scratch (keeps opencode data dirs)
+#
+# What it does with auth (and why it's safe):
+#   - Reads the ACTIVE gh token from the HOST keyring at launch time only.
+#   - Writes it to /tmp/opencode-gh-token (0600) and mounts it READ-ONLY
+#     into the container at /run/gh-token.
+#   - Inside: git uses a credential helper that reads /run/gh-token, and
+#     `opencode` runs with GH_TOKEN set. Nothing is written to disk config
+#     inside the container, so a leaked container = a 0600 /tmp file on host.
+#   - No token is ever stored in git, scripts, or env files.
+set -euo pipefail
+
+reset=0
+for a in "$@"; do case "$a" in -r|--reset) reset=1 ;; esac; done
+
+log() { echo "[openpublic] $*"; }
+die() { echo "[openpublic] ERROR: $*" >&2; exit 1; }
+
+command -v docker >/dev/null || die "docker is required"
+command -v gh >/dev/null     || die "gh CLI is required (https://cli.github.com)"
+
+# ── constants ────────────────────────────────────────────────────────────────
+CONTAINER=opencode
+NET_NAME=opencode-net
+NET_SUBNET=172.20.0.0/16
+IMAGE="${OPENPUBLIC_IMAGE:-opencode-warp}"
+TOKEN_FILE=/tmp/opencode-gh-token
+HOST_WORKSPACE="${OPENPUBLIC_WORKSPACE:-$(dirname "$PWD")}"
+WORKDIR_BASE=/workspace
+
+# ── extract host gh auth (before anything destructive) ───────────────────────
+if ! gh auth status >/dev/null 2>&1; then
+  die "gh is not authenticated on host. Run 'gh auth login' first."
+fi
+umask 077
+gh auth token >"$TOKEN_FILE"
+[ -s "$TOKEN_FILE" ] || die "could not extract gh token"
+GH_USER="$(gh api user --jq .login 2>/dev/null || echo "gh-token")"
+
+# ── reset: stop + remove container (opencode data dirs preserved by default) ──
+if [ "$reset" -eq 1 ]; then
+  log "Recreating $CONTAINER container (data dirs kept)..."
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+else
+  docker inspect "$CONTAINER" >/dev/null 2>&1 && log "Container exists, attaching..." || true
+fi
+
+# ── create container if missing ───────────────────────────────────────────────
+if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
+  docker network inspect "$NET_NAME" >/dev/null 2>&1 || \
+    docker network create --subnet "$NET_SUBNET" "$NET_NAME" >/dev/null
+
+  # pick a free IP in the subnet
+  OCP_IP=""
+  for i in $(seq 10 254); do
+    test_ip="172.20.0.$i"
+    used=$(docker network inspect "$NET_NAME" \
+        --format '{{range .Containers}}{{.IPv4Address}} {{end}}' 2>/dev/null || true)
+    grep -q "$test_ip/" <<<"$used" || { OCP_IP="$test_ip"; break; }
+  done
+  [ -n "$OCP_IP" ] || die "no free IP in $NET_SUBNET"
+
+  log "Creating container at $OCP_IP..."
+  docker run -d --name "$CONTAINER" \
+    --network "$NET_NAME" --ip "$OCP_IP" \
+    --cap-add NET_ADMIN --device /dev/net/tun \
+    -v "$HOST_WORKSPACE":"$WORKDIR_BASE" \
+    -v "$HOME/.opencode:/root/.opencode" \
+    -v "$HOME/.config/opencode:/root/.config/opencode" \
+    -v "$HOME/.local/share/opencode:/root/.local/share/opencode" \
+    -v "$HOME/.local/state/opencode:/root/.local/state/opencode" \
+    -v "$HOME/.cache/opencode:/root/.cache/opencode" \
+    -v "$TOKEN_FILE":/run/gh-token:ro \
+    -p 13000:3000 -p 13213:3213 -p 14096:4096 -p 17654:7654 \
+    "$IMAGE" sleep infinity >/dev/null
+  log "Created."
+fi
+
+docker start "$CONTAINER" >/dev/null
+
+# ── ensure git + gh inside (best-effort; binary gh, not apt) ──────────────────
+if ! docker exec "$CONTAINER" sh -c 'command -v git >/dev/null'; then
+  log "git missing inside container; best-effort install..."
+  docker exec "$CONTAINER" sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git' \
+    >/dev/null 2>&1 || log "git install skipped (auth still works via token once git present)"
+fi
+if ! docker exec "$CONTAINER" sh -c 'command -v gh >/dev/null'; then
+  log "gh missing inside container; installing official binary (fast, no apt)..."
+  GHV="$(gh --version | head -1 | awk '{print $3}')"
+  docker exec "$CONTAINER" sh -c "
+    curl -fsSL -o /tmp/gh.tgz https://github.com/cli/cli/releases/download/v${GHV}/gh_${GHV}_linux_amd64.tar.gz &&
+    tar -xzf /tmp/gh.tgz -C /tmp && install -m 0755 /tmp/gh_${GHV}_linux_amd64/bin/gh /usr/local/bin/gh &&
+    rm -rf /tmp/gh.tgz /tmp/gh_${GHV}_linux_amd64
+  " >/dev/null 2>&1 && log "gh ${GHV} installed." || log "gh binary install skipped; GIT auth still works."
+fi
+
+# ── wire credentials inside container (no token stored on disk here) ──────────
+docker exec -e GH_USER="$GH_USER" "$CONTAINER" sh -c '
+  if command -v git >/dev/null; then
+    git config --global credential.helper "!f() { test -r /run/gh-token && printf \"username=%s\\npassword=%s\\n\" \"$GH_USER\" \"$(cat /run/gh-token)\"; }; f"
+    git config --global --get-all credential.helper >/dev/null
+  fi
+' || die "could not wire git credentials inside container"
+log "git credential helper wired."
+
+# ── pick workspace dir + attach ───────────────────────────────────────────────
+cd_inside="${WORKDIR_BASE}/$(basename "$PWD")"
+docker exec "$CONTAINER" test -d "$cd_inside" 2>/dev/null || cd_inside="$WORKDIR_BASE"
+log "Attaching opencode in $cd_inside (user: $GH_USER)..."
+
+EXEC_ARGS=(docker exec -it -e "GH_TOKEN=$(cat "$TOKEN_FILE")")
+exec "${EXEC_ARGS[@]}" "$CONTAINER" sh -c "cd '$cd_inside' && exec opencode"
