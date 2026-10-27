@@ -42,6 +42,22 @@ TOKEN_FILE=/tmp/opencode-gh-token
 HOST_WORKSPACE="${OPENPUBLIC_WORKSPACE:-$(dirname "$PWD")}"
 WORKDIR_BASE=/workspace
 
+# ── safety guard: never mount/chown host system dirs ───────────────────────
+# Root cause of 2026-10-08 incident: running `openpublic` from `/` sets
+# HOST_WORKSPACE=/, mounts host `/` at /workspace, then
+# `chown -R 1000:1000 /workspace` inside the container recursively chowns
+# the whole host (broke /usr, /etc, /var/lib/docker, sudo). Refuse that.
+HOST_WORKSPACE="$(realpath -m "$HOST_WORKSPACE")"
+case "$HOST_WORKSPACE" in
+  "/"|"/home"|"/etc"|"/usr"|"/var"|"/opt"|"/srv"|"/boot"|"/root"|"/run"|"/tmp"|"/proc"|"/sys"|"/dev")
+    die "refusing to mount host system dir '$HOST_WORKSPACE' as workspace (cd into a project subdir, e.g. ~/CyberManju, or set OPENPUBLIC_WORKSPACE=/home/hautly)"
+    ;;
+esac
+case "$HOST_WORKSPACE" in
+  /home/*) ;;
+  *) die "refusing workspace '$HOST_WORKSPACE' outside /home (set OPENPUBLIC_WORKSPACE to a safe parent under /home)" ;;
+esac
+
 # ── extract host gh auth (before anything destructive) ───────────────────────
 if ! gh auth status >/dev/null 2>&1; then
   die "gh is not authenticated on host. Run 'gh auth login' first."
@@ -106,9 +122,16 @@ docker exec -e UID_GID="$UID_GID" -e USER_NAME="$USER_NAME" -e HOME_IN="$HOME_IN
 
 # ── ensure git + gh inside (best-effort; binary gh, not apt) — as root once ───
 if ! docker exec "$CONTAINER" sh -c 'command -v git >/dev/null'; then
-  log "git missing inside container; best-effort install..."
-  docker exec "$CONTAINER" sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git' \
-    >/dev/null 2>&1 || log "git install skipped"
+  log "git missing inside container; installing (may take ~1-2 min)..."
+  if timeout 420 docker exec "$CONTAINER" sh -c '
+    DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=3 2>&1 | tail -2
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git 2>&1 | tail -2
+    command -v git
+  '; then
+    log "git installed."
+  else
+    log "WARNING: git install failed/timed out; git ops inside container won't authenticate."
+  fi
 fi
 if ! docker exec "$CONTAINER" sh -c 'command -v gh >/dev/null'; then
   log "gh missing inside container; installing official binary (fast, no apt)..."
@@ -118,6 +141,41 @@ if ! docker exec "$CONTAINER" sh -c 'command -v gh >/dev/null'; then
     tar -xzf /tmp/gh.tgz -C /tmp && install -m 0755 /tmp/gh_${GHV}_linux_amd64/bin/gh /usr/local/bin/gh &&
     rm -rf /tmp/gh.tgz /tmp/gh_${GHV}_linux_amd64
   " >/dev/null 2>&1 && log "gh ${GHV} installed." || log "gh binary install skipped; GIT auth still works."
+fi
+
+# ── ensure newest opencode inside (container-local, checked each launch) ───────
+# OpenCode 2 ships as a npm binary package (@opencode/cli-<target>). On every
+# launch, compare the latest published version against the copy installed in the
+# container and (re)install only when it is missing or outdated.
+OCP_LATEST="$(curl -fsSL --max-time 15 https://opencode.ai/update/api/latest/cli/npm 2>/dev/null \
+  | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' || true)"
+if [ -z "$OCP_LATEST" ]; then
+  # offline fallback: match whatever the host is running
+  OCP_LATEST="$(opencode --version 2>/dev/null | sed -n 's/[^0-9]*\([0-9][0-9.]*\).*/\1/p' || true)"
+fi
+OCP_INSTALLED=""
+if docker exec "$CONTAINER" test -x /usr/local/bin/opencode >/dev/null 2>&1; then
+  OCP_INSTALLED="$(docker exec "$CONTAINER" /usr/local/bin/opencode --version 2>/dev/null \
+    | sed -n 's/[^0-9]*\([0-9][0-9.]*\).*/\1/p' || true)"
+fi
+if [ -n "$OCP_LATEST" ] && [ "$OCP_INSTALLED" != "$OCP_LATEST" ]; then
+  log "Installing newest opencode $OCP_LATEST inside (installed: ${OCP_INSTALLED:-none})..."
+  docker exec "$CONTAINER" sh -c "
+    set -e
+    target=linux-x64
+    case \"\$(uname -m)\" in aarch64|arm64) target=linux-arm64 ;; esac
+    if [ -f /etc/alpine-release ] || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; then
+      target=\"\$target-musl\"
+    fi
+    case \"\$target\" in linux-x64)
+      grep -qwi avx2 /proc/cpuinfo 2>/dev/null || target=\"\$target-baseline\"
+    ;; esac
+    curl -fsSL -o /tmp/oc.tgz \"https://registry.npmjs.org/@opencode/cli-\$target/-/cli-\$target-$OCP_LATEST.tgz\"
+    tar -xzf /tmp/oc.tgz -C /tmp
+    install -m 0755 /tmp/package/bin/opencode /usr/local/bin/opencode
+    rm -rf /tmp/oc.tgz /tmp/package
+  " >/dev/null 2>&1 && log "opencode $OCP_LATEST installed." \
+    || log "WARNING: opencode update failed; keeping ${OCP_INSTALLED:-existing}."
 fi
 
 # ── ensure workspace + data dirs writable by dev (owner match = your host uid) ─
@@ -139,4 +197,4 @@ log "Attaching opencode in $cd_inside (user: $USER_NAME, gh identity: $GH_USER).
 
 EXEC_ARGS=(docker exec -it --user "$USER_NAME" -e "HOME=$HOME_IN" -e "GH_TOKEN=$(cat "$TOKEN_FILE")")
 EXEC_CMD="${OPENPUBLIC_EXEC_CMD:-opencode}"
-exec "${EXEC_ARGS[@]}" "$CONTAINER" sh -c "cd '$cd_inside' && exec $EXEC_CMD"
+exec "${EXEC_ARGS[@]}" "$CONTAINER" sh -c "cd '$cd_inside' && export PATH=\"/usr/local/bin:\$HOME/.opencode/bin:\$PATH\" && exec $EXEC_CMD"
