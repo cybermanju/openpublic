@@ -141,8 +141,23 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
 
   log "Creating container at $OCP_IP (user $USER_NAME uid:gid $UID_GID)..."
   TOKEN_MOUNT=""
+  OP_BIN_MOUNT="-v $HOME/.opencode/bin/opencode:/usr/local/bin/opencode:ro"
   if [ "$no_auth" -eq 0 ]; then
+    # Authenticated: mount host's opencode data (persistent sessions + provider auth)
+    OP_DATA_MOUNT="-v $HOME/.opencode:$HOME_IN/.opencode"
+    SHARE_MOUNT="-v $HOME/.local/share/opencode:$HOME_IN/.local/share/opencode"
+    STATE_MOUNT="-v $HOME/.local/state/opencode:$HOME_IN/.local/state/opencode"
+    CACHE_MOUNT="-v $HOME/.cache/opencode:$HOME_IN/.cache/opencode"
+    CONFIG_MOUNT="-v $HOME/.config/opencode:$HOME_IN/.config/opencode"
     TOKEN_MOUNT="-v $TOKEN_FILE:/run/gh-token:ro"
+  else
+    # Unauthenticated: fresh empty data dirs → new device ID, bypasses server-side limit
+    TMP_ROOT="$(mktemp -d)"
+    OP_DATA_MOUNT="-v $TMP_ROOT/opencode:$HOME_IN/.opencode"
+    SHARE_MOUNT="-v $TMP_ROOT/share/opencode:$HOME_IN/.local/share/opencode"
+    STATE_MOUNT="-v $TMP_ROOT/state/opencode:$HOME_IN/.local/state/opencode"
+    CACHE_MOUNT="-v $TMP_ROOT/cache/opencode:$HOME_IN/.cache/opencode"
+    CONFIG_MOUNT="-v $TMP_ROOT/config/opencode:$HOME_IN/.config/opencode"
   fi
   # shellcheck disable=SC2086
   docker run -d --name "$CONTAINER" \
@@ -150,14 +165,26 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     --cap-add NET_ADMIN --device /dev/net/tun \
     -e HOME="$HOME_IN" \
     -v "$HOST_WORKSPACE":"$WORKDIR_BASE" \
-    -v "$HOME/.opencode:$HOME_IN/.opencode" \
-    -v "$HOME/.config/opencode:$HOME_IN/.config/opencode" \
-    -v "$HOME/.local/share/opencode:$HOME_IN/.local/share/opencode" \
-    -v "$HOME/.local/state/opencode:$HOME_IN/.local/state/opencode" \
-    -v "$HOME/.cache/opencode:$HOME_IN/.cache/opencode" \
+    $OP_BIN_MOUNT \
+    $OP_DATA_MOUNT \
+    $SHARE_MOUNT \
+    $STATE_MOUNT \
+    $CACHE_MOUNT \
+    $CONFIG_MOUNT \
     $TOKEN_MOUNT \
     -p 13000:3000 -p 13213:3213 -p 14096:4096 -p 17654:7654 \
-    "$IMAGE" sleep infinity >/dev/null
+    "$IMAGE" >/dev/null
+
+  # Wait for entrypoint (WARP setup + sleep infinity) to reach running state
+  log "Waiting for container to be ready..."
+  ready=0
+  for i in $(seq 1 90); do
+    if docker inspect "$CONTAINER" --format '{{.State.Running}}' 2>/dev/null | grep -q true; then
+      ready=1; break
+    fi
+    sleep 1
+  done
+  [ "$ready" = 1 ] || die "container did not reach running state"
 fi
 
 # ── bootstrap user (idempotent; runs as root inside, once) ────────────────────
@@ -214,27 +241,6 @@ OCP_INSTALLED=""
 if docker exec "$CONTAINER" test -x /usr/local/bin/opencode >/dev/null 2>&1; then
   OCP_INSTALLED="$(docker exec "$CONTAINER" /usr/local/bin/opencode --version 2>/dev/null \
     | sed -n 's/[^0-9]*\([0-9][0-9.]*\).*/\1/p' || true)"
-fi
-if [ -n "$OCP_LATEST" ] && [ "$OCP_INSTALLED" != "$OCP_LATEST" ]; then
-  log "Installing newest opencode $OCP_LATEST inside (installed: ${OCP_INSTALLED:-none})..."
-  OCP_LOG="/tmp/opencode-install-$$.log"
-  docker exec "$CONTAINER" sh -c "
-    set -e
-    target=linux-x64
-    case \"\$(uname -m)\" in aarch64|arm64) target=linux-arm64 ;; esac
-    if [ -f /etc/alpine-release ] || { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; }; then
-      target=\"\$target-musl\"
-    fi
-    case \"\$target\" in linux-x64)
-      grep -qwi avx2 /proc/cpuinfo 2>/dev/null || target=\"\$target-baseline\"
-    ;; esac
-    curl -fsSL -o /tmp/oc.tgz \"https://registry.npmjs.org/@opencode/cli-\$target/-/cli-\$target-$OCP_LATEST.tgz\"
-    tar -xzf /tmp/oc.tgz -C /tmp
-    install -m 0755 /tmp/package/bin/opencode /usr/local/bin/opencode
-    rm -rf /tmp/oc.tgz /tmp/package
-  " >"$OCP_LOG" 2>&1 \
-    && { log "opencode $OCP_LATEST installed."; rm -f "$OCP_LOG"; } \
-    || { log "WARNING: opencode update failed (see $OCP_LOG):"; tail -20 "$OCP_LOG" 2>/dev/null || true; }
 fi
 
 # ── ensure workspace + data dirs writable by dev (owner match = your host uid) ─

@@ -116,7 +116,9 @@ openpublic -u -- --prompt "hello"   # send one prompt to opencode, no rate-limit
 openpublic --continue      # continue the last opencode session inside the container
 ```
 
-Everything after `--` is passed through to `opencode` verbatim. Use `-r` to get a new container IP (Cloudflare/WARP identity reset) and wipe tabs/rate-limit state; use `-u` to not bind to your host GitHub account's server-side free-tier cap.
+Everything after `--` is passed through to `opencode` verbatim. Use `-r` to get a new container IP
+(Cloudflare/WARP identity reset) and wipe tabs/rate-limit state; use `-u` to run with a fresh
+opencode device identity (empty data dirs, no stored auth) and no `GH_TOKEN`.
 
 ## How auth works (no credentials leave your machine)
 
@@ -130,16 +132,30 @@ Everything after `--` is passed through to `opencode` verbatim. Use `-r` to get 
 
 - Docker (local daemon or reachable via `DOCKER_HOST`)
 - `gh` authenticated on the host **only for authenticated mode** (`gh auth status`). Skip with `-u`/`--no-auth`.
-- Image `opencode-warp` (or override with `OPENPUBLIC_IMAGE`) with `opencode` in PATH. If `git`/`gh` are missing inside, the script installs them best-effort (authenticated mode only).
+- Image `opencode-warp` (or override with `OPENPUBLIC_IMAGE`). The opencode binary is taken from
+  your host's `~/.opencode/bin/opencode` (mounted read-only); the image only needs to provide the
+  WARP container runtime. If `git`/`gh` are missing inside, the script installs them best-effort
+  (authenticated mode only).
 
 ## Limit-ban reset
 
-OpenCode applies a server-side free-tier message cap tied to your GitHub account. To fully reset it:
+OpenCode's free tier is rate-limited server-side, tied to your opencode device identity and IP.
+To fully reset it:
 
-1. `openpublic -r -u` — recreates the container with a **new IP** (never reuses the old one → new Cloudflare/WARP identity) and **wipes** `~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode` (tabs + bans vanish).
-2. `-u` passes no `GH_TOKEN`, so opencode runs unauthenticated and is **not** bound to your host GitHub account's cap.
+```bash
+openpublic -r -u -- --prompt "your message"
+```
 
-Then run `openpublic -u -- --prompt "your message"`.
+1. `-r` recreates the container: **new outbound IP** via WARP (never reuses the previous IP) and
+   **wipes** `~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode`
+   (device ID, tabs, bans vanish).
+2. `-u` mounts **empty opencode data dirs** inside the container (no stored Google auth,
+   no device ID) and passes no `GH_TOKEN`, so opencode is not bound to your host GitHub
+   account's server-side cap.
+3. `-- --prompt "..."` forwards the prompt to opencode.
+
+Verified: `openpublic -r -u -- run "Say exactly: TOKEN"` returns the token from the model with
+no "free usage limit reached" error.
 
 ## Environment variables
 
