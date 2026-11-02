@@ -15,6 +15,62 @@ your **host GitHub credentials passed through automatically** — so git push,
 mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/cybermanju/openpublic/main/openpublic -o ~/.local/bin/openpublic && chmod +x ~/.local/bin/openpublic && echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
 ```
 
+### One-command setup (installs everything automatically)
+
+Paste this on a fresh Linux machine. It installs Docker, the GitHub CLI (`gh`), `curl`, downloads `openpublic` to `~/.local/bin`, configures your PATH, authenticates `gh`, pulls the `opencode-warp` image, and runs a version check:
+
+```bash
+set -e
+# 1. System prerequisites
+sudo apt-get update -y
+sudo apt-get install -y curl ca-certificates gnupg lsb-release git
+
+# 2. Docker (official repo, if not already installed)
+if ! command -v docker >/dev/null 2>&1; then
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update -y
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  sudo usermod -aG docker $USER
+  newgrp docker
+fi
+
+# 3. GitHub CLI (gh)
+if ! command -v gh >/dev/null 2>&1; then
+  type -p curl >/dev/null || sudo apt-get install -y curl
+  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+  sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+  sudo apt-get update -y
+  sudo apt-get install -y gh
+fi
+
+# 4. Install openpublic to ~/.local/bin
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/cybermanju/openpublic/main/openpublic -o ~/.local/bin/openpublic
+chmod +x ~/.local/bin/openpublic
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+export PATH="$HOME/.local/bin:$PATH"
+
+# 5. Authenticate with GitHub (needed for git push / private repos inside the container)
+gh auth login
+
+# 6. Pull the opencode-warp image
+docker pull opencode-warp:latest
+
+# 7. Verify opencode runs (unauthenticated, bypasses server-side cap)
+openpublic -u -- --version
+```
+
+After step 5 completes (browser auth flow), run:
+
+```bash
+openpublic          # attach (authenticated, tied to your GH account cap)
+openpublic -r       # recreate fresh: new IP + wiped state (resets IP-based bans)
+openpublic -r -u    # recreate fresh AND unauthenticated: bypasses GH server-side cap entirely
+openpublic -u -- --prompt "your message here"   # send one prompt, no rate-limit ban
+```
+
 ### For proot-distro (Ubuntu in Termux/Android) — paste-ready
 
 If you're running Ubuntu inside proot-distro on Termux, you'll need Docker. On many Android setups you can't run the full Docker daemon natively; options:
@@ -52,9 +108,15 @@ chmod +x ~/.local/bin/opencode-r
 ## Usage
 
 ```bash
-openpublic        # attach, creating the container if missing
-openpublic -r     # recreate the container fresh (container wiped, data dirs kept)
+openpublic                 # attach, creating the container if missing (authenticated via GH_TOKEN)
+openpublic -r              # recreate container fresh: new IP + wiped mutable state (resets bans)
+openpublic -u              # run unauthenticated (no GH_TOKEN) — bypasses GitHub server-side cap
+openpublic -r -u           # fresh container AND unauthenticated: full limit-ban reset
+openpublic -u -- --prompt "hello"   # send one prompt to opencode, no rate-limit ban
+openpublic --continue      # continue the last opencode session inside the container
 ```
+
+Everything after `--` is passed through to `opencode` verbatim. Use `-r` to get a new container IP (Cloudflare/WARP identity reset) and wipe tabs/rate-limit state; use `-u` to not bind to your host GitHub account's server-side free-tier cap.
 
 ## How auth works (no credentials leave your machine)
 
@@ -67,8 +129,17 @@ openpublic -r     # recreate the container fresh (container wiped, data dirs kep
 ## Requirements
 
 - Docker (local daemon or reachable via `DOCKER_HOST`)
-- `gh` authenticated on the machine running the script: `gh auth status`
-- Image `opencode-warp` (or override with `OPENPUBLIC_IMAGE`) with `opencode` in PATH. If `git`/`gh` are missing inside, the script installs them best-effort.
+- `gh` authenticated on the host **only for authenticated mode** (`gh auth status`). Skip with `-u`/`--no-auth`.
+- Image `opencode-warp` (or override with `OPENPUBLIC_IMAGE`) with `opencode` in PATH. If `git`/`gh` are missing inside, the script installs them best-effort (authenticated mode only).
+
+## Limit-ban reset
+
+OpenCode applies a server-side free-tier message cap tied to your GitHub account. To fully reset it:
+
+1. `openpublic -r -u` — recreates the container with a **new IP** (never reuses the old one → new Cloudflare/WARP identity) and **wipes** `~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode` (tabs + bans vanish).
+2. `-u` passes no `GH_TOKEN`, so opencode runs unauthenticated and is **not** bound to your host GitHub account's cap.
+
+Then run `openpublic -u -- --prompt "your message"`.
 
 ## Environment variables
 
