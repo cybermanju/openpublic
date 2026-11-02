@@ -21,6 +21,11 @@
 #      commands and opencode itself always run with --user dev.)
 set -euo pipefail
 
+# ── cleanup temp files on exit ─────────────────────────────────────────────────
+MID_FILE=""
+cleanup() { [ -n "$MID_FILE" ] && rm -f "$MID_FILE" 2>/dev/null || true; }
+trap cleanup EXIT
+
 reset=0
 no_auth=0
 passthrough=()
@@ -159,6 +164,10 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     CACHE_MOUNT="-v $TMP_ROOT/cache/opencode:$HOME_IN/.cache/opencode"
     CONFIG_MOUNT="-v $TMP_ROOT/config/opencode:$HOME_IN/.config/opencode"
   fi
+  # Randomize machine-id so opencode gets a fresh device identity on every reset
+  MID_FILE="$(mktemp)"
+  cat /proc/sys/kernel/random/uuid | tr -d '-' > "$MID_FILE"
+  MID_MOUNT="-v $MID_FILE:/etc/machine-id:ro"
   # shellcheck disable=SC2086
   docker run -d --name "$CONTAINER" \
     --network "$NET_NAME" --ip "$OCP_IP" \
@@ -172,6 +181,7 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     $CACHE_MOUNT \
     $CONFIG_MOUNT \
     $TOKEN_MOUNT \
+    $MID_MOUNT \
     -p 13000:3000 -p 13213:3213 -p 14096:4096 -p 17654:7654 \
     "$IMAGE" >/dev/null
 
