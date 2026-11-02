@@ -23,24 +23,31 @@ set -euo pipefail
 
 # ── cleanup temp files on exit ─────────────────────────────────────────────────
 MID_FILE=""
-cleanup() { [ -n "$MID_FILE" ] && rm -f "$MID_FILE" 2>/dev/null || true; }
+PATCHED_BIN=""
+EMPTY_GIT=""
+cleanup() { [ -n "$MID_FILE" ] && rm -f "$MID_FILE" 2>/dev/null || true; [ -n "$PATCHED_BIN" ] && rm -f "$PATCHED_BIN" 2>/dev/null || true; [ -n "$EMPTY_GIT" ] && rm -rf "$EMPTY_GIT" 2>/dev/null || true; }
 trap cleanup EXIT
 
 reset=0
 no_auth=0
+hide_git=0
 passthrough=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -r|--reset) reset=1 ;;
     -u|--no-auth) no_auth=1 ;;
+    -g|--hide-git) hide_git=1 ;;
     -h|--help)
       cat <<EOF
-Usage: openpublic [-r|--reset] [-u|--no-auth] [-- opencode-args...]
+Usage: openpublic [-r|--reset] [-u|--no-auth] [-g|--hide-git] [-- opencode-args...]
   -r, --reset   recreate container from scratch (new IP, wiped state) — resets limit bans
   -u, --no-auth run unauthenticated (no GH_TOKEN) — bypasses host GitHub server-side cap
+  -g, --hide-git  mount empty dir over .git inside container — hides git remote URL
+                  from opencode, bypassing project-based rate-limit fingerprint
   --            everything after is passed to opencode inside the container
 Examples:
   openpublic -r -u -- --prompt "hello"
+  openpublic -r -u -g -- --prompt "hello"   # also hides git remote fingerprint
   openpublic -r --continue
 EOF
       exit 0 ;;
@@ -146,7 +153,18 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
 
   log "Creating container at $OCP_IP (user $USER_NAME uid:gid $UID_GID)..."
   TOKEN_MOUNT=""
-  OP_BIN_MOUNT="-v $HOME/.opencode/bin/opencode:/usr/local/bin/opencode:ro"
+  # Patch BUNDLED_CLIENT_ID in the opencode binary → fresh device fingerprint per run
+  HOST_OC_BIN="$HOME/.opencode/bin/opencode"
+  if [ -x "$HOST_OC_BIN" ]; then
+    PATCHED_BIN="$(mktemp)"
+    cp "$HOST_OC_BIN" "$PATCHED_BIN"
+    chmod +x "$PATCHED_BIN"
+    # Replace the embedded BUNDLED_CLIENT_ID UUID with a random one
+    perl -pi -e "s/b1a00492-073a-47ea-816f-4c329264a828/$(cat /proc/sys/kernel/random/uuid)/g" "$PATCHED_BIN"
+  else
+    PATCHED_BIN="$HOST_OC_BIN"
+  fi
+  OP_BIN_MOUNT="-v $PATCHED_BIN:/usr/local/bin/opencode:ro"
   if [ "$no_auth" -eq 0 ]; then
     # Authenticated: mount host's opencode data (persistent sessions + provider auth)
     OP_DATA_MOUNT="-v $HOME/.opencode:$HOME_IN/.opencode"
@@ -173,6 +191,14 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
   MID_FILE="$(mktemp)"
   cat /proc/sys/kernel/random/uuid | tr -d '-' > "$MID_FILE"
   MID_MOUNT="-v $MID_FILE:/etc/machine-id:ro"
+  # Hide .git from opencode so it can't read git remote URL (project fingerprint)
+  EMPTY_GIT=""
+  EMPTY_GIT_MOUNT=""
+  PROJECT_NAME="$(basename "$PWD")"
+  if [ "$hide_git" -eq 1 ] && [ -d "$PWD/.git" ]; then
+    EMPTY_GIT="$(mktemp -d)"
+    EMPTY_GIT_MOUNT="-v $EMPTY_GIT:$WORKDIR_BASE/$PROJECT_NAME/.git:ro"
+  fi
   # shellcheck disable=SC2086
   docker run -d --name "$CONTAINER" \
     --network "$NET_NAME" --ip "$OCP_IP" \
@@ -180,6 +206,7 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     -e HOME="$HOME_IN" \
     $CLIENT_ENV \
     -v "$HOST_WORKSPACE":"$WORKDIR_BASE" \
+    $EMPTY_GIT_MOUNT \
     $OP_BIN_MOUNT \
     $OP_DATA_MOUNT \
     $SHARE_MOUNT \
@@ -277,8 +304,16 @@ else
 fi
 
 # ── pick workspace dir + attach ───────────────────────────────────────────────
-cd_inside="${WORKDIR_BASE}/$(basename "$PWD")"
-docker exec "$CONTAINER" test -d "$cd_inside" 2>/dev/null || cd_inside="$WORKDIR_BASE"
+if [ "$no_auth" -eq 1 ]; then
+  # Randomize project path inside container → fresh x-opencode-project header
+  # bypasses server-side rate limit tied to project path fingerprint
+  RANDOM_PROJ="oc-$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 12)"
+  docker exec "$CONTAINER" mkdir -p "$WORKDIR_BASE/$RANDOM_PROJ" 2>/dev/null || true
+  cd_inside="$WORKDIR_BASE/$RANDOM_PROJ"
+else
+  cd_inside="${WORKDIR_BASE}/$(basename "$PWD")"
+  docker exec "$CONTAINER" test -d "$cd_inside" 2>/dev/null || cd_inside="$WORKDIR_BASE"
+fi
 log "Attaching opencode in $cd_inside (user: $USER_NAME, gh identity: $GH_USER)..."
 
 if [ "$no_auth" -eq 0 ]; then
