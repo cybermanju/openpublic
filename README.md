@@ -111,14 +111,42 @@ chmod +x ~/.local/bin/opencode-r
 openpublic                 # attach, creating the container if missing (authenticated via GH_TOKEN)
 openpublic -r              # recreate container fresh: new IP + wiped mutable state (resets bans)
 openpublic -u              # run unauthenticated (no GH_TOKEN) — bypasses GitHub server-side cap
-openpublic -r -u           # fresh container AND unauthenticated: full limit-ban reset
-openpublic -u -- --prompt "hello"   # send one prompt to opencode, no rate-limit ban
+openpublic -r -u           # full reset: new IP + fresh device ID + no GH_TOKEN
+openpublic -u -- --prompt "hello"   # send one prompt to opencode (default model), no rate-limit ban
+openpublic -r -u -- run "msg" --model opencode/nemotron-3.5-lightning-free   # different free model
 openpublic --continue      # continue the last opencode session inside the container
 ```
 
 Everything after `--` is passed through to `opencode` verbatim. Use `-r` to get a new container IP
 (Cloudflare/WARP identity reset) and wipe tabs/rate-limit state; use `-u` to run with a fresh
-opencode device identity (empty data dirs, no stored auth) and no `GH_TOKEN`.
+opencode device identity (empty data dirs, no stored auth, randomized `OPENCODE_CLIENT`) and no
+`GH_TOKEN`.
+
+### Bypassing OpenCode's server-side free-tier limit
+
+OpenCode's free tier is rate-limited **per model per day**. Each free model has a separate limit.
+When the default model (`opencode/mimo-v2.6-flash-free`) hits its cap, switch models:
+
+```bash
+openpublic -r -u -- run "your message" --model opencode/nemotron-3.5-lightning-free
+openpublic -r -u -- run "your message" --model opencode/big-pickle
+openpublic -r -u -- run "your message" --model opencode/deepseek-v4.1-flash-free
+openpublic -r -u -- run "your message" --model opencode/flint-40b-free
+openpublic -r -u -- run "your message" --model opencode/glm-5.3-flash-free
+openpublic -r -u -- run "your message" --model opencode/pulse-alpha-free
+```
+
+List all free models: `openpublic -u -- models`
+
+### Full identity reset (ban evasion)
+
+Each `-r -u` run gives:
+- **New container IP** via WARP (never reuses previous IP)
+- **New `/etc/machine-id`** (randomized UUID)
+- **Empty opencode data dirs** (no stored sessions, auth, or device ID)
+- **Randomized `OPENCODE_CLIENT`** (changes `x-opencode-client` header + User-Agent)
+- **Randomized `OPENCODE_TUI_CHANNEL`** (changes User-Agent channel)
+- **No `GH_TOKEN`** (not tied to your GitHub account's server-side cap)
 
 ## How auth works (no credentials leave your machine)
 

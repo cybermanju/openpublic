@@ -163,6 +163,11 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     STATE_MOUNT="-v $TMP_ROOT/state/opencode:$HOME_IN/.local/state/opencode"
     CACHE_MOUNT="-v $TMP_ROOT/cache/opencode:$HOME_IN/.cache/opencode"
     CONFIG_MOUNT="-v $TMP_ROOT/config/opencode:$HOME_IN/.config/opencode"
+    # Randomize OPENCODE_CLIENT → changes x-opencode-client header AND User-Agent
+    # sent to systemone, so the server sees a brand-new client identity each reset
+    RANDOM_CLIENT="oc-$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 16)"
+    RANDOM_CHANNEL="cli-$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 8)"
+    CLIENT_ENV="-e OPENCODE_CLIENT=$RANDOM_CLIENT -e OPENCODE_TUI_CHANNEL=$RANDOM_CHANNEL"
   fi
   # Randomize machine-id so opencode gets a fresh device identity on every reset
   MID_FILE="$(mktemp)"
@@ -173,6 +178,7 @@ if ! docker inspect "$CONTAINER" >/dev/null 2>&1; then
     --network "$NET_NAME" --ip "$OCP_IP" \
     --cap-add NET_ADMIN --device /dev/net/tun \
     -e HOME="$HOME_IN" \
+    $CLIENT_ENV \
     -v "$HOST_WORKSPACE":"$WORKDIR_BASE" \
     $OP_BIN_MOUNT \
     $OP_DATA_MOUNT \
